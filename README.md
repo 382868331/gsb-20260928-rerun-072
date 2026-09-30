@@ -24,3 +24,16 @@
 在 layers.py 注册新语义、在 quantize.py 增加转换路径，产物仍用
 edgequant.quant.v1 格式保存，即可复用 runner/evaluate 做同口径比较。
 
+## 第二轮：逐层混合精度
+- edgequant/layers.py   PRECISIONS = (8, 16, 32)；32 表示该层保留浮点
+- edgequant/mixed.py    convert_mixed：给定逐层允许误差 max_err 与可选
+  存储预算（字节），从全 int8 贪心升级误差最差层；约束无法满足时抛
+  PrecisionBudgetError 明确失败，不降低误差标准
+- 报告含每层选定 bits、存储代价（字节）与实测 max_abs_err
+- 浮点层下游的定点层仍按校准统计获得正确输入 scale；相邻层位宽不同
+  时 runner 按 scale 比重量化
+- 边界验证报告新增 risk 字段（饱和总数 / overflow / 说明），
+  超校准范围输入的饱和与风险信息随产物报告保留
+
+  python main.py convert --max-err 0.05 --storage-budget 5000
+  # 约束无法满足：打印 CONVERT FAILED 并以退出码 3 失败
