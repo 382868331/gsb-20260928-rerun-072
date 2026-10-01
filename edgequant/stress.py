@@ -41,3 +41,23 @@ def build_stress_inputs():
         [-1e4, 1e4, -1e4, 1e4],       # 极端异常值
     ]
     return np.asarray(rows, dtype=np.float64)
+
+
+def build_stress_groups():
+    """三个代表性输入组，各自容差不同，共享存储预算。
+
+    - nominal：校准分布内的正常输入，容差最严；
+    - wide：幅度更大但仍覆盖在多组校准并集内的宽幅输入；
+    - edge：贴近校准上界的边缘输入，对饱和更敏感，容差放宽但仍独立考核。
+    """
+    _, calib = build_stress_model()
+    rng = np.random.default_rng(11)
+    nominal = calib
+    wide = rng.uniform(-1.0, 1.0, (24, 4))
+    edge = rng.uniform(0.8, 1.0, (16, 4)) * rng.choice([-1.0, 1.0],
+                                                       (16, 4))
+    return [
+        {"name": "nominal", "samples": nominal, "tol_max_abs": 0.03},
+        {"name": "wide", "samples": wide, "tol_max_abs": 0.08},
+        {"name": "edge", "samples": edge, "tol_max_abs": 0.10},
+    ]

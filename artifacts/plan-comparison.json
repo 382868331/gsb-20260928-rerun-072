@@ -1,0 +1,399 @@
+{
+  "plans": [
+    {
+      "plan": "all-4bit",
+      "feasible": false,
+      "total_bits": 576,
+      "budget_bits": 100000,
+      "weight_bits": {
+        "fc1": 4,
+        "fc2": 4
+      },
+      "groups": [
+        {
+          "name": "nominal",
+          "satisfied": false,
+          "max_abs_err_overall": 0.12256655259262028
+        },
+        {
+          "name": "wide",
+          "satisfied": false,
+          "max_abs_err_overall": 0.15012038558181212
+        },
+        {
+          "name": "edge",
+          "satisfied": false,
+          "max_abs_err_overall": 0.19553582167100625
+        }
+      ],
+      "error": "未满足逐输入组误差：[{'group': 'nominal', 'layer': 'fc1', 'max_abs_err': 0.12256655259262028, 'tol': 0.05}, {'group': 'nominal', 'layer': 'fc2', 'max_abs_err': 0.10290741456048802, 'tol': 0.05}, {'group': 'wide', 'layer': 'fc1', 'max_abs_err': 0.15012038558181212, 'tol': 0.1}, {'group': 'wide', 'layer': 'fc2', 'max_abs_err': 0.1497961481763267, 'tol': 0.1}, {'group': 'edge', 'layer': 'fc1', 'max_abs_err': 0.19553582167100625, 'tol': 0.15}, {'group': 'edge', 'layer': 'fc2', 'max_abs_err': 0.18321413551119758, 'tol': 0.15}]"
+    },
+    {
+      "plan": "greedy-mixed",
+      "feasible": true,
+      "total_bits": 800,
+      "budget_bits": 100000,
+      "weight_bits": {
+        "fc1": 8,
+        "fc2": 8
+      },
+      "groups": [
+        {
+          "name": "nominal",
+          "satisfied": true,
+          "max_abs_err_overall": 0.048772672087763924
+        },
+        {
+          "name": "wide",
+          "satisfied": true,
+          "max_abs_err_overall": 0.08404119110282338
+        },
+        {
+          "name": "edge",
+          "satisfied": true,
+          "max_abs_err_overall": 0.10406218103958031
+        }
+      ]
+    },
+    {
+      "plan": "all-8bit",
+      "feasible": true,
+      "total_bits": 800,
+      "budget_bits": 100000,
+      "weight_bits": {
+        "fc1": 8,
+        "fc2": 8
+      },
+      "groups": [
+        {
+          "name": "nominal",
+          "satisfied": true,
+          "max_abs_err_overall": 0.048772672087763924
+        },
+        {
+          "name": "wide",
+          "satisfied": true,
+          "max_abs_err_overall": 0.08404119110282338
+        },
+        {
+          "name": "edge",
+          "satisfied": true,
+          "max_abs_err_overall": 0.10406218103958031
+        }
+      ]
+    }
+  ],
+  "pairwise": [
+    {
+      "from": "all-4bit",
+      "to": "greedy-mixed",
+      "available": true,
+      "storage_delta_bits": 224,
+      "per_layer_effects": [
+        {
+          "group": "nominal",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.12256655259262028,
+            "to": 0.014975597500095916,
+            "delta": -0.10759095509252437
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "nominal",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.10290741456048802,
+            "to": 0.048772672087763924,
+            "delta": -0.054134742472724096
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.15012038558181212,
+            "to": 0.017343938249561486,
+            "delta": -0.13277644733225064
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.1497961481763267,
+            "to": 0.08404119110282338,
+            "delta": -0.06575495707350332
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.19553582167100625,
+            "to": 0.014773086313234107,
+            "delta": -0.18076273535777215
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.18321413551119758,
+            "to": 0.10406218103958031,
+            "delta": -0.07915195447161727
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        }
+      ]
+    },
+    {
+      "from": "greedy-mixed",
+      "to": "all-8bit",
+      "available": true,
+      "storage_delta_bits": 0,
+      "per_layer_effects": [
+        {
+          "group": "nominal",
+          "layer": "fc1",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.014975597500095916,
+            "to": 0.014975597500095916,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        },
+        {
+          "group": "nominal",
+          "layer": "fc2",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.048772672087763924,
+            "to": 0.048772672087763924,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc1",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.017343938249561486,
+            "to": 0.017343938249561486,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc2",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.08404119110282338,
+            "to": 0.08404119110282338,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc1",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.014773086313234107,
+            "to": 0.014773086313234107,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc2",
+          "bits": {
+            "from": 8,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.10406218103958031,
+            "to": 0.10406218103958031,
+            "delta": 0.0
+          },
+          "effect": "unchanged",
+          "to_satisfied": true
+        }
+      ]
+    },
+    {
+      "from": "all-4bit",
+      "to": "all-8bit",
+      "available": true,
+      "storage_delta_bits": 224,
+      "per_layer_effects": [
+        {
+          "group": "nominal",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.12256655259262028,
+            "to": 0.014975597500095916,
+            "delta": -0.10759095509252437
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "nominal",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.10290741456048802,
+            "to": 0.048772672087763924,
+            "delta": -0.054134742472724096
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.15012038558181212,
+            "to": 0.017343938249561486,
+            "delta": -0.13277644733225064
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "wide",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.1497961481763267,
+            "to": 0.08404119110282338,
+            "delta": -0.06575495707350332
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc1",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.19553582167100625,
+            "to": 0.014773086313234107,
+            "delta": -0.18076273535777215
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        },
+        {
+          "group": "edge",
+          "layer": "fc2",
+          "bits": {
+            "from": 4,
+            "to": 8
+          },
+          "max_abs_err": {
+            "from": 0.18321413551119758,
+            "to": 0.10406218103958031,
+            "delta": -0.07915195447161727
+          },
+          "effect": "improved",
+          "to_satisfied": true
+        }
+      ]
+    }
+  ],
+  "selected_plan": "greedy-mixed",
+  "feasible": true,
+  "all_constraints": {
+    "tol_max_abs_default": 0.05,
+    "storage_budget_bits": 100000
+  },
+  "failures": [
+    {
+      "plan": "all-4bit",
+      "unsatisfied_groups": [
+        "nominal",
+        "wide",
+        "edge"
+      ],
+      "budget_satisfied": true
+    }
+  ]
+}
