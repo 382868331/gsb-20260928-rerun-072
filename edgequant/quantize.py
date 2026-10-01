@@ -8,6 +8,9 @@
 import numpy as np
 from .layers import (FP_LAYERS, CONVERTIBLE, quantize_tensor,
                      WEIGHT_BIT_CHOICES, qmin_qmax)
+from .groups import groups_from_calib, samples_hash
+
+import time
 
 
 class UnsupportedLayerError(Exception):
@@ -101,6 +104,217 @@ def _layer_max_errs(layers, qmodel, samples):
         got = qt["q_out"].astype(np.float64) * qt["out_scale"]
         errs[fa["name"]] = float(np.max(np.abs(got - ref)))
     return errs
+
+
+def _dense_names(layers):
+    return [l["name"] for l in layers if l["type"] == "dense"]
+
+
+def group_layer_errs(layers, qmodel, groups):
+    """逐输入组、逐层 max_abs_err（含整网误差传播），附风险汇总。
+
+    不对各组误差做平均：每组独立统计，任一 dense 层超差都原样保留。
+    """
+    from .runner import run_quant
+    out = {}
+    for g in groups:
+        fp_acts = run_fp_trace(layers, g.samples)
+        _, trace, risk = run_quant(qmodel, g.samples, return_risk=True)
+        errs = {}
+        for fa, qt in zip(fp_acts, trace):
+            ref = fa["output"]
+            got = qt["q_out"].astype(np.float64) * qt["out_scale"]
+            errs[fa["name"]] = float(np.max(np.abs(got - ref)))
+        out[g.name] = {"errs": errs, "risk": risk}
+    return out
+
+
+def _worst_violation(groups, dense_names, group_errs):
+    """所有组、所有 dense 层中相对各自误差上限的最差超出量（正数=超差）。"""
+    worst = 0.0
+    for g in groups:
+        for n in dense_names:
+            lim = g.layer_tol(n)
+            if lim is None:
+                continue
+            worst = max(worst, group_errs[g.name]["errs"][n] - lim)
+    return worst
+
+
+def _build_group_reports(groups, dense_names, group_errs):
+    """每组独立结论：逐 dense 层 上限/实测/满足，越界组附裁剪与风险。"""
+    reports = []
+    for g in groups:
+        per_layer = {}
+        group_ok = True
+        for n in dense_names:
+            lim = g.layer_tol(n)
+            val = group_errs[g.name]["errs"][n]
+            ok = (lim is None) or val <= lim
+            per_layer[n] = {"tol_max_abs": lim, "max_abs_err": val,
+                            "satisfied": bool(ok)}
+            group_ok = group_ok and ok
+        risk = group_errs[g.name]["risk"]
+        reports.append({
+            "name": g.name,
+            "in_calib_range": g.in_calib,
+            "n_samples": int(g.samples.shape[0]),
+            "samples_absmax": float(np.max(np.abs(g.samples))),
+            "samples_sha256": samples_hash(g.samples),
+            "tol_satisfied": bool(group_ok),
+            "per_layer_max_abs": per_layer,
+            "input_clipped": risk["input_clipped"],
+            "input_out_of_calib": risk["input_out_of_calib"],
+            "activation_saturated": risk["activation_saturated"],
+            "acc_int32_saturated": risk["acc_int32_saturated"],
+            "has_risk": risk["has_risk"],
+        })
+    return reports
+
+
+def _select_precision_groups(layers, groups, storage_budget, calib_pool):
+    """多组约束下的贪心混合精度。
+
+    全部 dense 层从 4bit 起步；每一步挑选“使跨组最差超出量下降最多 /
+    额外存储比特”的层升级。所有组的误差上限必须同时满足，
+    不以平均误差掩盖某一组失效；预算内做不到或全 8bit 仍超差即失败。
+    """
+    dense_names = _dense_names(layers)
+    bits_for = {l["name"]: WEIGHT_BIT_CHOICES[0] for l in layers}
+    all8 = {l["name"]: 8 for l in layers}
+    scales = calibrate(layers, calib_pool)
+
+    q8 = _assemble_qmodel(scales, layers, all8)
+    errs8 = group_layer_errs(layers, q8, groups)
+    unreachable = []
+    for g in groups:
+        for n in dense_names:
+            lim = g.layer_tol(n)
+            if lim is not None and errs8[g.name]["errs"][n] > lim:
+                unreachable.append(
+                    f"组[{g.name}]层[{n}] 误差 {errs8[g.name]['errs'][n]:.6g}"
+                    f" > 上限 {lim:.6g}")
+    if unreachable:
+        raise PrecisionTargetError(
+            "误差要求在最高 8bit 精度下仍无法达到（不自动放宽目标）："
+            + "；".join(unreachable))
+
+    qmodel = _assemble_qmodel(scales, layers, bits_for)
+    group_errs = group_layer_errs(layers, qmodel, groups)
+    while _worst_violation(groups, dense_names, group_errs) > 0.0:
+        cost_now, _ = _storage_cost(layers, bits_for)
+        cur_worst = _worst_violation(groups, dense_names, group_errs)
+        best = None
+        for n in dense_names:
+            if bits_for[n] >= 8:
+                continue
+            trial = dict(bits_for)
+            trial[n] = 8
+            cost_new, _ = _storage_cost(layers, trial)
+            extra = cost_new - cost_now
+            if storage_budget is not None and cost_new > storage_budget:
+                continue
+            trial_q = _assemble_qmodel(scales, layers, trial)
+            trial_errs = group_layer_errs(layers, trial_q, groups)
+            trial_worst = _worst_violation(groups, dense_names, trial_errs)
+            gain = cur_worst - trial_worst
+            score = gain / extra if extra > 0 else float("inf")
+            if best is None or score > best[0]:
+                best = (score, n, trial, trial_errs, cost_new)
+        if best is None or best[0] <= 0:
+            status = _build_group_reports(groups, dense_names, group_errs)
+            raise PrecisionTargetError(
+                "没有部署方案能同时满足全部输入组约束（不自动放宽目标）："
+                f"预算 {storage_budget} bits 内无法继续降低跨组最差超差 "
+                f"{cur_worst:.6g}；各组满足情况 "
+                f"{[(r['name'], r['tol_satisfied']) for r in status]}")
+        _, _, bits_for, group_errs, _ = best
+
+    qmodel = _assemble_qmodel(scales, layers, bits_for)
+    total_cost, per_cost = _storage_cost(layers, bits_for)
+    if storage_budget is not None and total_cost > storage_budget:
+        raise PrecisionTargetError(
+            f"达标方案存储 {total_cost} bits 超过共同预算 "
+            f"{storage_budget} bits")
+    return qmodel, scales, bits_for, group_errs, total_cost, per_cost
+
+
+def convert_groups(layers, groups, storage_budget=None, weight_bits=None,
+                   plan_id=None, created_at=None):
+    """多代表性输入组口径的转换。
+
+    - 激活 scale 只用校准范围内各组的汇总样本确定（校准来源可追溯）；
+    - 每组独立误差上限，共享同一存储预算；
+    - 任一组不满足即整体失败，绝不以平均误差掩盖；
+    - 产物记录 plan_id / 时间 / 组定义 / 校准来源指纹 / 原限制。
+    """
+    bad = [l["name"] for l in layers if l["type"] not in CONVERTIBLE]
+    if bad:
+        raise UnsupportedLayerError(
+            f"拒绝转换：不支持的层 {bad}，当前仅支持 {sorted(CONVERTIBLE)}")
+    if not groups:
+        raise ValueError("至少需要一个输入组")
+    calib_pool = np.concatenate(
+        [g.samples for g in groups if g.in_calib], axis=0)
+    if calib_pool.shape[0] == 0:
+        raise ValueError("至少需要一个 in_calib_range=True 的校准来源组")
+    dense_names = _dense_names(layers)
+
+    if weight_bits is not None:
+        if weight_bits not in WEIGHT_BIT_CHOICES:
+            raise ValueError(f"weight_bits 仅支持 {WEIGHT_BIT_CHOICES}")
+        scales = calibrate(layers, calib_pool)
+        bits_for = {l["name"]: weight_bits for l in layers}
+        qmodel = _assemble_qmodel(scales, layers, bits_for)
+        group_errs = group_layer_errs(layers, qmodel, groups)
+        total_cost, per_cost = _storage_cost(layers, bits_for)
+        if _worst_violation(groups, dense_names, group_errs) > 0.0:
+            status = _build_group_reports(groups, dense_names, group_errs)
+            failed = [r["name"] for r in status if not r["tol_satisfied"]]
+            raise PrecisionTargetError(
+                f"强制 {weight_bits}bit 未满足全部输入组约束：{failed}")
+        if storage_budget is not None and total_cost > storage_budget:
+            raise PrecisionTargetError(
+                f"强制 {weight_bits}bit 代价 {total_cost} bits 超过共同预算 "
+                f"{storage_budget} bits")
+    else:
+        (qmodel, scales, bits_for, group_errs,
+         total_cost, per_cost) = _select_precision_groups(
+            layers, groups, storage_budget, calib_pool)
+
+    group_reports = _build_group_reports(groups, dense_names, group_errs)
+    all_ok = all(r["tol_satisfied"] for r in group_reports)
+    report = {
+        "plan_id": plan_id,
+        "created_at": created_at or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "per_layer_bits": per_cost,
+        "w_bits_for": {n: bits_for[n] for n in dense_names},
+        "total_bits": total_cost,
+        "budget_bits": storage_budget,
+        "all_groups_satisfied": bool(all_ok),
+        "input_groups": [g.as_meta() for g in groups],
+        "calibration": {
+            "source_groups": [g.name for g in groups if g.in_calib],
+            "pooled_n_samples": int(calib_pool.shape[0]),
+            "pooled_samples_sha256": samples_hash(calib_pool),
+            "scale_source": "pooled max-abs over in-calib-range groups",
+            "activation_scales": {
+                "__input__": scales["__input__"],
+                **{n: scales[n] for n in scales if n != "__input__"}},
+        },
+        "group_reports": group_reports,
+    }
+    qmodel["mixed_precision_report"] = report
+    qmodel["provenance"] = {
+        "plan_id": plan_id,
+        "original_constraints": {
+            "storage_budget_bits": storage_budget,
+            "forced_weight_bits": weight_bits,
+            "groups": [g.as_meta() for g in groups],
+        },
+        "calibration_source": report["calibration"],
+    }
+    return qmodel
 
 
 def _select_precision(layers, samples, scales, tol_max_abs, storage_budget):
