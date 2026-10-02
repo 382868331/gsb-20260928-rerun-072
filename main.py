@@ -10,6 +10,9 @@ from edgequant.evaluate import (evaluate, boundary_check, stress_compare,
                                 reverify)
 from edgequant.stress import (build_stress_model, build_stress_inputs,
                               build_stress_groups)
+from edgequant.deployment import (build_grouped_deployment,
+                                  compare_unified_and_grouped,
+                                  verify_deployment)
 
 
 def make_model(path):
@@ -49,7 +52,8 @@ def _load_groups(calib_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["make-model", "convert", "compare",
+    ap.add_argument("cmd", choices=["make-model", "convert", "deploy",
+                                    "compare",
                                     "evaluate", "boundary", "stress",
                                     "reverify"])
     ap.add_argument("--model", default="artifacts/model.json")
@@ -58,6 +62,10 @@ def main():
     ap.add_argument("--quant", default="artifacts/model.quant.json")
     ap.add_argument("--comparison",
                     default="artifacts/plan-comparison.json")
+    ap.add_argument("--deployment",
+                    default="artifacts/model.deployment.json")
+    ap.add_argument("--grouped", action="store_true",
+                    help="按显式输入组条件构建多方案路由部署")
     ap.add_argument("--tol", type=float, default=1e-3,
                     help="允许的逐层 max_abs_err")
     ap.add_argument("--budget", type=int, default=None,
@@ -119,6 +127,39 @@ def main():
             raise SystemExit(3)
         return
 
+    if args.cmd == "deploy":
+        if args.grouped:
+            dep = build_grouped_deployment(
+                layers, groups, conditions=None, tol_max_abs=args.tol,
+                storage_budget=args.budget,
+                calib_source=args.calib)
+            M.save_deployment(args.deployment, dep)
+            cmp = compare_unified_and_grouped(
+                layers, groups, conditions=None, tol_max_abs=args.tol,
+                storage_budget=args.budget, calib_source=args.calib)
+            with open(args.comparison, "w") as f:
+                json.dump({k: v for k, v in cmp.items()
+                           if k != "deployment"}, f,
+                          indent=2, ensure_ascii=False)
+            print(f"grouped deployment -> {args.deployment}")
+            print(f"scheme comparison -> {args.comparison}")
+            print(f"统一方案 {dep['storage']['unified_bits']} bits; "
+                  f"共同占用 {dep['storage']['shared_unique_total_bits']} / "
+                  f"{dep['storage']['budget_bits']} bits")
+            print("入选分组: %s" % [
+                c["group"] for c in dep["deployment_report"]
+                ["group_candidates"] if c["selected"]])
+            for r in dep["route_policy"]["rules"]:
+                print(f"  {r['group']}: {r['plan']} ({r['selection']})")
+            return
+        q = convert(layers, groups, tol_max_abs=args.tol,
+                    storage_budget=args.budget,
+                    weight_bits=args.weight_bits,
+                    calib_source=args.calib)
+        M.save_quant(args.quant, q)
+        print(f"quant model -> {args.quant}")
+        return
+
     if args.cmd == "compare":
         cmp = compare_plans(layers, groups, tol_max_abs=args.tol,
                             storage_budget=args.budget)
@@ -155,7 +196,11 @@ def main():
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         return
     if args.cmd == "reverify":
-        rep, ok = reverify(layers, q, groups)
+        if args.grouped:
+            dep = M.load_deployment(args.deployment)
+            rep, ok = verify_deployment(layers, dep, groups)
+        else:
+            rep, ok = reverify(layers, q, groups)
         print(f"reverify passed: {ok}")
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         if not ok:

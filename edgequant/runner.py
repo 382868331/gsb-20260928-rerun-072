@@ -15,6 +15,13 @@ def run_quant(qmodel, x, return_risk=False):
     return_risk=False（默认，向后兼容）：返回 (浮点输出, 逐层轨迹)。
     return_risk=True：额外返回风险汇总 dict。
     """
+    if qmodel.get("format") == "edgequant.deployment.v2":
+        from .deployment import run_deployment
+        y, trace, risk, _ = run_deployment(qmodel, x, return_risk=True)
+        if return_risk:
+            return y, trace, risk
+        return y, trace
+
     x = np.asarray(x, dtype=np.float64)
     in_scale = qmodel["in_scale"]
     xq, in_clipped = quantize_tensor(x, in_scale)

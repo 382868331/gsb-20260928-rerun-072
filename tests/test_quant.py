@@ -1,3 +1,4 @@
+import copy
 import json
 import numpy as np
 import pytest
@@ -9,6 +10,10 @@ from edgequant.evaluate import (evaluate, boundary_check, stress_compare,
                                 reverify)
 from edgequant.stress import (build_stress_model, build_stress_inputs,
                               build_stress_groups)
+from edgequant.deployment import (build_grouped_deployment,
+                                  compare_unified_and_grouped,
+                                  verify_deployment)
+from edgequant.routing import validate_policy_fingerprint, PrecisionRouteError
 
 
 def _setup():
@@ -252,3 +257,114 @@ def test_calib_groups_roundtrip(tmp_path):
     M.save_calib(p1, _np.zeros((4, 4)))
     one = M.load_calib_groups(p1)
     assert len(one) == 1 and one[0][0] == "default"
+
+
+# ---------- 按组精度方案：条件冻结、交叠/未覆盖回退、共同存储、重载复核 ----------
+
+def _routed_setup():
+    rng = np.random.default_rng(22)
+    layers, _ = build_stress_model()
+    n = 16
+    nominal = rng.uniform(-0.15, 0.15, (n, 4))
+    wide = np.full((n, 4), 0.8) * rng.choice([-1.0, 1.0], (n, 4))
+    edge = np.full((n, 4), 0.95) * rng.choice([-1.0, 1.0], (n, 4))
+    groups = [
+        {"name": "nominal", "samples": nominal, "tol_max_abs": 0.01},
+        {"name": "wide", "samples": wide, "tol_max_abs": 0.02},
+        {"name": "edge", "samples": edge, "tol_max_abs": 0.03},
+    ]
+    conditions = [
+        {"name": "nominal",
+         "all": [{"feature": "__absmax__", "max": 0.5}]},
+        {"name": "wide",
+         "all": [{"feature": "__absmax__", "min": 0.5,
+                  "max": 0.9}]},
+        {"name": "edge",
+         "all": [{"feature": "__absmax__", "min": 0.9,
+                  "max": 1.0}]},
+    ]
+    return layers, groups, conditions
+
+
+def test_grouped_plan_compares_storage_and_group_improvements():
+    layers, groups, conditions = _routed_setup()
+    cmp = compare_unified_and_grouped(
+        layers, groups, conditions, tol_max_abs=0.02)
+    dep = cmp["deployment"]
+    assert cmp["selected_groups"] == ["wide"]
+    assert cmp["additional_storage_bits"] == 448
+    wide = next(c for c in cmp["improvements"] if c["group"] == "wide")
+    assert wide["selected"]
+    assert wide["grouped_worst_max_abs"] < wide["unified_worst_max_abs"]
+    assert dep["storage"]["shared_unique_total_bits"] == 848
+    assert dep["route_policy"]["decision_time"] == \
+        "before-prediction-and-frozen"
+
+
+def test_budget_selects_only_affordable_group_candidates():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02, storage_budget=800)
+    assert dep["storage"]["unified_bits"] == 400
+    assert dep["storage"]["shared_unique_total_bits"] == 400
+    assert dep["plans"].keys() == {"unified"}
+    assert all(r["plan"] == "unified"
+               for r in dep["route_policy"]["rules"])
+
+
+def test_overlap_and_uncovered_have_deterministic_fallback_paths():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02)
+    x = np.array([
+        [0.2, 0.0, 0.0, 0.0],
+        [0.6, 0.6, 0.0, 0.0],
+        [0.95, 0.95, 0.95, 0.95],
+        [2.0, 0.0, 0.0, 0.0],
+    ])
+    # 制造规则交叠：wide 与 edge 都能命中，但必须按固定顺序只走第一条
+    dep["route_policy"]["rules"][1]["condition"] = {
+        "all": [{"feature": "__absmax__", "min": 0.5, "max": 1.0}]}
+    y, _, risk, assignments = __import__(
+        "edgequant.deployment", fromlist=["run_deployment"]
+    ).run_deployment(dep, x, return_risk=True)
+    assert y.shape == (4, 2)
+    assert assignments[0]["status"] == "matched"
+    assert assignments[2]["status"] == "ambiguous"
+    assert assignments[2]["plan"] == "group:wide"
+    assert assignments[2]["matching_groups"] == ["wide", "edge"]
+    assert assignments[3]["status"] == "uncovered"
+    assert assignments[3]["plan"] == "unified"
+    assert assignments[3]["fallback_used"]
+    assert risk["uncovered_count"] == 1
+    assert risk["ambiguous_count"] == 1
+
+
+def test_grouped_artifact_roundtrip_verifies_paths_errors_and_storage(tmp_path):
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        calib_source="test:routed-groups")
+    p = tmp_path / "routed.json"
+    M.save_deployment(p, dep)
+    loaded = M.load_deployment(p)
+    rep, ok = verify_deployment(layers, loaded, groups, conditions)
+    assert ok
+    wide = next(g for g in rep["groups"] if g["group"] == "wide")
+    assert wide["selected_group_plan"]
+    assert wide["selected_plan_calibration_domain_errors"]["fc2"] < +        wide["unified_plan_calibration_domain_errors"]["fc2"]
+    assert rep["storage"]["shared_unique_total_bits"] == 848
+    assert rep["boundary"]["all_uncovered_and_fallback"]
+    assert rep["boundary"]["plans_executed"] == ["unified"]
+
+
+def test_changing_group_conditions_invalidates_saved_calibration(tmp_path):
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02)
+    changed = copy.deepcopy(conditions)
+    changed[1]["all"][0]["max"] = 0.95
+    with pytest.raises(PrecisionRouteError):
+        validate_policy_fingerprint(dep, groups, changed)
+    with pytest.raises(PrecisionRouteError):
+        verify_deployment(layers, dep, groups, changed)

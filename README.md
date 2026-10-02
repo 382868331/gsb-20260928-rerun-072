@@ -1,5 +1,6 @@
-边缘模型部署研究系统（多输入组逐层混合精度 + 逐组误差/共同预算约束
-             + 部署方案对比 + 饱和风险保留 + 重载复核与可追溯）
+边缘模型部署研究系统（多输入组逐层混合精度 + 按组精度路由
+             + 逐组误差/共同预算约束 + 部署方案对比 + 饱和风险保留
+             + 重载复核与可追溯）
 
 ## 结构
 - edgequant/layers.py    浮点/定点语义：激活对称 int8；权重逐层 4bit/8bit；
@@ -11,6 +12,12 @@
                           对比；不支持的层抛 UnsupportedLayerError；任一输入
                           组误差或共同预算达不到时抛 PrecisionTargetError，
                           不降低标准、不做组间平均
+- edgequant/routing.py   部署前冻结的 JSON 输入条件；只按输入特征做确定性
+                          首条规则路由，不读取预测误差；交叠标 ambiguous，
+                          未覆盖标 uncovered，均走产物声明的统一回退方案
+- edgequant/deployment.py 统一回退方案 + 按输入组独立校准的候选精度方案；
+                          预算只允许容纳部分候选时按改善/额外存储预先选择；
+                          产物记录实际路径、逐组误差、共同占用存储与边界结果
 - edgequant/runner.py    独立运行器：只吃转换产物 JSON，纯整数推理；
                           逐层报告输入截断/激活饱和/int32 累加溢出与风险标记
 - edgequant/evaluate.py  逐层 max_abs_err/RMSE/SQNR + 风险；boundary_check
@@ -18,9 +25,10 @@
                           reverify 产物重载后重复核对（逐组预测复现 + 越界风险）
 - edgequant/stress.py    压力小模型与 nominal/wide/edge 三个代表性输入组
 - main.py                CLI：make-model / convert / compare / evaluate /
-                          boundary / stress / reverify
+                          deploy / boundary / stress / reverify
 - tests/test_quant.py    混合精度选择、预算/误差显式失败、逐组独立达标、
-                          方案对比改善/退化、重载复核、越界风险等用例
+                          方案对比改善/退化、交叠/未覆盖回退、预算仅容纳
+                          部分候选、条件变更失效、重载复核、越界风险等用例
 
 ## 固定口径
 - 激活：对称 int8，round-half-to-even，饱和截断 [-127,127]
@@ -39,6 +47,18 @@
   部署方案，逐组给出达标情况与存储代价，pairwise 展示每一层精度变化
   让每个输入组的误差 improved / unchanged / degraded；没有方案满足
   全部约束时 feasible=false 并列明失败，不自动选择或放宽目标
+- 统一 vs 按组：deploy --grouped 先构建统一方案作为公共回退，再为每个
+  输入组独立校准候选。选择只依据保存前校准结果中的误差改善/额外存储，
+  运行时只执行冻结条件，不能看过实际预测误差后改选。额外存储会逐项说明
+  换来了哪些组的 worst max_abs_err 改善；未入选组仍走统一方案
+- 路由去向：规则按数组顺序判断并采用首条命中；同时符合多组时记录
+  ambiguous、命中的全部组和实际规则；不符合任何组时记录 uncovered。两种
+  情况的实际 plan 都是 route_policy 中声明的 fallback_plan（默认 unified）
+- 共同存储：统一回退方案的完整权重计入一次，每个入选分组方案完整计入；
+  不对不同方案间的权重或 scale 做去重，总存储超过预算则该候选不入选
+- 校准证明范围：保存 policy_sha256_16，内容包括分组样本、容差和条件。
+  修改条件边界或分组样本后，verify_deployment 会拒绝沿用旧产物，必须重新
+  校准生成新证明
 - 重载复核：reverify 只吃转换产物 JSON，重新预测并逐层核对与产物记录
   逐元素一致；越界输入必须报告输入裁剪、激活饱和/累加溢出与风险；
   provenance 保留旧方案限制（容差/预算）、校准来源路径与校准内容指纹
@@ -49,6 +69,8 @@
   python main.py make-model                     # 示例模型 + 单组/多组校准
   python main.py compare --tol 0.05            # 三方案逐组改善/退化对比
   python main.py compare --tol 0.05 --budget 800  # 再加共同存储预算
+  python main.py deploy --grouped --tol 0.05 --budget 1200
+  python main.py reverify --grouped
   python main.py convert --tol 0.05            # 多组自动混合精度
   python main.py convert --tol 0.05 --budget 800
   python main.py convert --weight-bits 8       # 强制全 8bit（仍逐组校验）
@@ -65,3 +87,9 @@ provenance 记录 calib_source、各组样本数与容差、校准指纹 calib_s
 预算与生成时间。校准文件新增 edgequant.calib-groups.v1（旧 v1 单组
 仍可读取，按 default 单组处理）。独立 load_quant 后 run_quant 的输出、
 风险以及 reverify 重算误差均与转换阶段逐元素一致。
+
+按组部署新增 edgequant.deployment.v2：顶层 plans 保存 unified 与入选的
+group:<name> 完整方案；route_policy.rules 保存条件、顺序、实际 plan 与
+未入选原因；storage 保存统一方案比特、各入选方案比特、共同占用总量和
+预算；deployment_report 保存每组统一/分组误差与新增存储改善。复合产物
+也可直接传给 run_quant，返回风险中的 route_assignments 可供逐样本审计。

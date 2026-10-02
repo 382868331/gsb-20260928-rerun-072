@@ -6,6 +6,7 @@ MODEL_FORMAT = "edgequant.model.v1"
 CALIB_FORMAT = "edgequant.calib.v1"
 CALIB_GROUPS_FORMAT = "edgequant.calib-groups.v1"
 QUANT_FORMAT = "edgequant.quant.v1"
+DEPLOYMENT_FORMAT = "edgequant.deployment.v2"
 
 
 def _enc(a):
@@ -109,6 +110,17 @@ def save_quant(path, qmodel):
 def load_quant(path):
     doc = json.load(open(path))
     assert doc["format"] == QUANT_FORMAT
+    return doc
+
+
+def save_deployment(path, deployment):
+    assert deployment["format"] == DEPLOYMENT_FORMAT, deployment["format"]
+    _dump(path, deployment)
+
+
+def load_deployment(path):
+    doc = json.load(open(path))
+    assert doc["format"] == DEPLOYMENT_FORMAT, doc["format"]
     return doc
 
 
