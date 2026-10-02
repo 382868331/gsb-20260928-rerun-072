@@ -1,5 +1,6 @@
 """CLI：make-model / convert / compare / evaluate / boundary / stress /
-reverify。支持多输入组（各自容差 + 共同存储预算）。"""
+reverify / deploy / deploy-compare / deploy-reverify。
+支持多输入组（各自容差 + 共同存储预算）与按组选择方案的部署产物。"""
 import argparse
 import json
 import numpy as np
@@ -8,6 +9,7 @@ from edgequant.quantize import (convert, compare_plans, UnsupportedLayerError,
                                 PrecisionTargetError)
 from edgequant.evaluate import (evaluate, boundary_check, stress_compare,
                                 reverify)
+from edgequant import deploy as D
 from edgequant.stress import (build_stress_model, build_stress_inputs,
                               build_stress_groups)
 
@@ -38,7 +40,13 @@ def make_model(path):
          "tol_max_abs": 0.15},
     ]
     gpath = path + ".calib-groups.json"
-    M.save_calib_groups(gpath, M.normalize_groups(groups))
+    # 路由条件随校准保存：nominal/wide/edge 的范围互相交叠，
+    # 交叠时按声明顺序优先级生效，未覆盖输入显式走回退方案
+    conditions = {"nominal": {"abs_max_le": 0.8},
+                  "wide": {"abs_max_le": 1.0},
+                  "edge": {"abs_max_le": 1.0}}
+    M.save_calib_groups(gpath, M.normalize_groups(groups),
+                        conditions=conditions)
     print(f"model -> {path}; calib -> {path}.calib.json; groups -> {gpath}")
 
 
@@ -51,13 +59,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["make-model", "convert", "compare",
                                     "evaluate", "boundary", "stress",
-                                    "reverify"])
+                                    "reverify", "deploy",
+                                    "deploy-compare", "deploy-reverify"])
     ap.add_argument("--model", default="artifacts/model.json")
     ap.add_argument("--calib",
                     default="artifacts/model.json.calib-groups.json")
     ap.add_argument("--quant", default="artifacts/model.quant.json")
     ap.add_argument("--comparison",
                     default="artifacts/plan-comparison.json")
+    ap.add_argument("--deploy", default="artifacts/model.deploy.json")
     ap.add_argument("--tol", type=float, default=1e-3,
                     help="允许的逐层 max_abs_err")
     ap.add_argument("--budget", type=int, default=None,
@@ -92,6 +102,44 @@ def main():
 
     layers = M.load_model(args.model)
     groups = _load_groups(args.calib)
+    if args.cmd == "deploy":
+        raw = M.load_calib_groups_raw(args.calib)
+        try:
+            dep = D.build_deployment(
+                layers, raw, tol_max_abs=args.tol,
+                storage_budget=args.budget, calib_source=args.calib)
+        except PrecisionTargetError as e:
+            print(f"DEPLOY FAILED (目标不可达): {e}")
+            raise SystemExit(3)
+        M.save_deploy(args.deploy, dep)
+        st = dep["storage"]
+        print(f"deployment -> {args.deploy}")
+        print(f"共同存储: {st['total_bits']} / 预算 "
+              f"{st['budget_bits']} bits (回退 {st['fallback_bits']} + "
+              f"专用 {sum(st['dedicated_bits'].values())})")
+        for g in dep["deploy_report"]["groups"]:
+            print(f"  组 {g['name']} -> {g['scheme']} "
+                  f"[{g['effect']}] worst={g['max_abs_err_overall']:.6g} "
+                  f"(统一方案 {g['unified_max_abs_err_overall']:.6g})")
+        if not dep["deploy_report"]["all_groups_satisfied"]:
+            print("DEPLOY FAILED: 存在输入组未满足约束（不自动放宽目标）")
+            raise SystemExit(3)
+        return
+
+    if args.cmd in ("deploy-compare", "deploy-reverify"):
+        dep = M.load_deploy(args.deploy)
+        raw = M.load_calib_groups_raw(args.calib)
+        if args.cmd == "deploy-compare":
+            rep = D.compare_with_unified(layers, dep, raw)
+            print(json.dumps(rep, indent=2, ensure_ascii=False))
+            return
+        rep, ok = D.reverify_deploy(layers, dep, raw)
+        print(f"deploy reverify passed: {ok}")
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
+        if not ok:
+            raise SystemExit(3)
+        return
+
     if args.cmd == "convert":
         try:
             q = convert(layers, groups, tol_max_abs=args.tol,

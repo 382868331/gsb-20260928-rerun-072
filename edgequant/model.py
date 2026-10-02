@@ -6,6 +6,7 @@ MODEL_FORMAT = "edgequant.model.v1"
 CALIB_FORMAT = "edgequant.calib.v1"
 CALIB_GROUPS_FORMAT = "edgequant.calib-groups.v1"
 QUANT_FORMAT = "edgequant.quant.v1"
+DEPLOY_FORMAT = "edgequant.deploy.v1"
 
 
 def _enc(a):
@@ -83,12 +84,17 @@ def normalize_groups(groups):
     return out
 
 
-def save_calib_groups(path, groups, source=None):
-    """groups: normalize_groups 的产物 (name, samples, tol)。"""
+def save_calib_groups(path, groups, source=None, conditions=None):
+    """groups: normalize_groups 的产物 (name, samples, tol)；
+    conditions: 可选 {组名: {"abs_max_le": b}} 路由条件，随校准保存。"""
+    entries = []
+    for n, s, t in groups:
+        e = {"name": n, "samples": _enc(s), "tol_max_abs": t}
+        if conditions and n in conditions:
+            e["condition"] = conditions[n]
+        entries.append(e)
     doc = {"format": CALIB_GROUPS_FORMAT, "source": source or str(path),
-           "groups": [
-               {"name": n, "samples": _enc(s), "tol_max_abs": t}
-               for n, s, t in groups]}
+           "groups": entries}
     _dump(path, doc)
 
 
@@ -109,6 +115,39 @@ def save_quant(path, qmodel):
 def load_quant(path):
     doc = json.load(open(path))
     assert doc["format"] == QUANT_FORMAT
+    return doc
+
+
+def load_calib_groups_raw(path):
+    """读取多组校准文件并保留每组路由条件（供按组部署使用）。
+
+    返回 [{"name", "samples"(ndarray), "tol_max_abs", "condition"?}]。
+    旧单组 v1 文件返回单个 default 组、无条件。
+    """
+    doc = json.load(open(path))
+    if doc["format"] == CALIB_FORMAT:
+        return [{"name": "default",
+                 "samples": np.asarray(doc["samples"], dtype=np.float64),
+                 "tol_max_abs": None}]
+    assert doc["format"] == CALIB_GROUPS_FORMAT, doc["format"]
+    out = []
+    for g in doc["groups"]:
+        e = {"name": str(g["name"]),
+             "samples": np.asarray(g["samples"], dtype=np.float64),
+             "tol_max_abs": g.get("tol_max_abs")}
+        if g.get("condition") is not None:
+            e["condition"] = dict(g["condition"])
+        out.append(e)
+    return out
+
+
+def save_deploy(path, deploy):
+    _dump(path, {"format": DEPLOY_FORMAT, **deploy})
+
+
+def load_deploy(path):
+    doc = json.load(open(path))
+    assert doc["format"] == DEPLOY_FORMAT, doc["format"]
     return doc
 
 
