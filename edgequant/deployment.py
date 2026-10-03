@@ -7,6 +7,8 @@ from .quantize import (convert, _fingerprint, _group_layer_errs,
                        _storage_cost, PrecisionTargetError)
 from .routing import (normalize_conditions, route_inputs,
                       policy_fingerprint)
+from .sessions import (normalize_session_policy,
+                        session_policy_fingerprint)
 
 
 DEPLOYMENT_FORMAT = "edgequant.deployment.v2"
@@ -49,7 +51,9 @@ def _route_report(groups, rules, fallback_plan):
 
 def build_grouped_deployment(layers, calib, conditions=None, tol_max_abs=1e-3,
                              storage_budget=None, calib_source=None,
-                             fallback_plan="unified", created_at=None):
+                             fallback_plan="unified", created_at=None,
+                             session_policy=None,
+                             runtime_storage_budget=None):
     """构建含确定性路由的部署产物。
 
     选择在转换前完成：统一方案作为公共回退，每个输入组各自校准一个候选。
@@ -61,6 +65,7 @@ def build_grouped_deployment(layers, calib, conditions=None, tol_max_abs=1e-3,
               for n, s, t in normalize_groups(calib)]
     dense_names = [l["name"] for l in layers if l["type"] == "dense"]
     conditions = normalize_conditions(groups, conditions)
+    session_policy = normalize_session_policy(session_policy)
     condition_by_name = {c["name"]: {k: v for k, v in c.items()
                                      if k != "name"}
                          for c in conditions}
@@ -145,6 +150,8 @@ def build_grouped_deployment(layers, calib, conditions=None, tol_max_abs=1e-3,
             "rules": rules,
             "calibration": {
                 "policy_sha256_16": policy_fingerprint(groups, conditions),
+                "session_policy_sha256_16":
+                    session_policy_fingerprint(session_policy),
                 "group_fingerprints": {
                     n: _fingerprint([(n, s, t)]) for n, s, t in groups}}},
         "storage": {
@@ -157,7 +164,16 @@ def build_grouped_deployment(layers, calib, conditions=None, tol_max_abs=1e-3,
             "budget_satisfied": storage_budget is None
                                 or total_cost <= storage_budget,
             "accounting": "one unified fallback + selected complete group "
-                          "plans; scales/weights are not deduplicated"},
+                          "plans; scales/weights are not deduplicated",
+            "plan_bits": {"unified": unified_cost,
+                          **{"group:%s" % c["group"]: c["cost_bits"]
+                             for c in candidates
+                             if c["group"] in selected_groups}},
+            "active_session_state_bits": 0,
+            "runtime_budget_bits": (runtime_storage_budget
+                                    if runtime_storage_budget is not None
+                                    else storage_budget)},
+        "session_policy": session_policy,
         "deployment_report": {
             "unified_group_worst_max_abs": unified_worst,
             "group_candidates": [{
@@ -222,10 +238,12 @@ def run_deployment(deployment, x, return_risk=False):
 
 def compare_unified_and_grouped(layers, calib, conditions=None,
                                 tol_max_abs=1e-3, storage_budget=None,
-                                calib_source=None):
+                                calib_source=None, session_policy=None,
+                                runtime_storage_budget=None):
     deployment = build_grouped_deployment(
         layers, calib, conditions, tol_max_abs, storage_budget,
-        calib_source)
+        calib_source, session_policy=session_policy,
+        runtime_storage_budget=runtime_storage_budget)
     return {
         "deployment": deployment,
         "unified_storage_bits":
@@ -248,14 +266,16 @@ def compare_unified_and_grouped(layers, calib, conditions=None,
 
 
 def verify_deployment(layers, deployment, calib, conditions=None,
-                      boundary_factor=2.0, seed=0):
+                      boundary_factor=2.0, seed=0,
+                      session_policy=None):
     """重载后复核路径、预测误差、回退结果和共同存储。"""
     from .model import normalize_groups
     from .routing import validate_policy_fingerprint
     from .quantize import run_fp_trace
     from .runner import run_quant
 
-    validate_policy_fingerprint(deployment, calib, conditions)
+    validate_policy_fingerprint(deployment, calib, conditions,
+                                session_policy)
     groups = [(n, s, tol_max_abs if t is None else t)
               for n, s, t in normalize_groups(calib)]
     dense_names = [l["name"] for l in layers if l["type"] == "dense"]

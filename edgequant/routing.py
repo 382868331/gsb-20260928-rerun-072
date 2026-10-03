@@ -109,8 +109,11 @@ def policy_fingerprint(groups, conditions):
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
-def validate_policy_fingerprint(deployment, groups, conditions=None):
+def validate_policy_fingerprint(deployment, groups, conditions=None,
+                                session_policy=None):
     from .model import normalize_groups
+    from .sessions import (normalize_session_policy,
+                            session_policy_fingerprint)
     groups = normalize_groups(groups)
     rules = deployment["route_policy"]["rules"]
     if conditions is None:
@@ -122,5 +125,15 @@ def validate_policy_fingerprint(deployment, groups, conditions=None):
     if current != saved:
         raise PrecisionRouteError(
             "分组样本、容差或条件已改变；原校准证明不能自动沿用到新范围 "
-            "(saved=%s, current=%s)" % (saved, current))
+                           "(saved=%s, current=%s)" % (saved, current))
+    current_session = normalize_session_policy(session_policy)
+    saved_session = deployment["route_policy"]["calibration"].get(
+        "session_policy_sha256_16")
+    if saved_session is not None and saved_session != \
+            session_policy_fingerprint(current_session):
+        raise PrecisionRouteError(
+            "会话切换或最短保持规则已改变；原校准范围不能给新切换路径背书 "
+            "(saved=%s, current=%s)" % (
+                saved_session,
+                session_policy_fingerprint(current_session)))
     return True

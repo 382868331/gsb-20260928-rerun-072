@@ -14,6 +14,8 @@ from edgequant.deployment import (build_grouped_deployment,
                                   compare_unified_and_grouped,
                                   verify_deployment)
 from edgequant.routing import validate_policy_fingerprint, PrecisionRouteError
+from edgequant.sessions import (SessionDeploymentRuntime, preview_switch,
+                                compare_session_selection_strategies)
 
 
 def _setup():
@@ -286,6 +288,20 @@ def _routed_setup():
     return layers, groups, conditions
 
 
+def _add_edge_plan(dep, state_bits=None):
+    dep["storage"]["plan_bits"]["group:wide"] = 448
+    dep["plans"]["group:edge"] = copy.deepcopy(dep["plans"]["unified"])
+    dep["plans"]["group:edge"]["plan_name"] = "group:edge"
+    dep["storage"]["plan_bits"]["group:edge"] = 448
+    edge_rule = next(r for r in dep["route_policy"]["rules"]
+                     if r["group"] == "edge")
+    edge_rule["plan"] = "group:edge"
+    if state_bits is not None:
+        dep["plans"]["group:edge"]["session_state"] = \
+            {"state_bits": state_bits}
+    return dep
+
+
 def test_grouped_plan_compares_storage_and_group_improvements():
     layers, groups, conditions = _routed_setup()
     cmp = compare_unified_and_grouped(
@@ -368,3 +384,154 @@ def test_changing_group_conditions_invalidates_saved_calibration(tmp_path):
         validate_policy_fingerprint(dep, groups, changed)
     with pytest.raises(PrecisionRouteError):
         verify_deployment(layers, dep, groups, changed)
+
+
+# ---------- 有状态会话：最短保持、显式重启/迁移、活跃状态预算与重开 ----------
+
+def test_session_switch_uses_only_current_rule_and_records_restart():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"min_hold_inputs": 2, "state_bits_per_session": 16},
+        runtime_storage_budget=100000)
+    _add_edge_plan(dep)
+    rt = SessionDeploymentRuntime(dep)
+    stream = np.array([[0.2, 0, 0, 0], [0.8, 0.8, 0, 0],
+                       [0.8, 0.8, 0, 0], [0.95, 0.95, 0.95, 0.95],
+                       [0.95, 0.95, 0.95, 0.95]])
+    decisions = []
+    for i, row in enumerate(stream):
+        decisions.append(rt.process(row, session_id="s1", position=i))
+
+    assert [d["plan"] for d in decisions] == [
+        "unified", "unified", "group:wide", "group:wide", "group:edge"]
+    assert decisions[1]["assignment"]["status"] == "retained-min-hold"
+    switch = decisions[2]["switch"]
+    assert switch["action"] == "restart-at-boundary"
+    assert switch["compatible"] is False
+    assert switch["restart_position"] == 2
+    assert switch["previous_output_positions"] == [0, 1]
+    assert decisions[3]["assignment"]["status"] == "retained-min-hold"
+    session = rt.sessions["s1"]
+    assert session["state_lineage"] == [
+        {"plan": "unified", "position": 0, "action": "initialize"},
+        {"plan": "group:wide", "position": 2,
+         "action": "restart-at-boundary"},
+        {"plan": "group:edge", "position": 4,
+         "action": "restart-at-boundary"}]
+
+
+def test_preview_does_not_mutate_and_explicit_migration_continues():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"min_hold_inputs": 2},
+        runtime_storage_budget=100000)
+    rt = SessionDeploymentRuntime(dep, migrations={
+        "unified->group:wide": lambda state, old, new, pos: {
+            **state, "plan": new, "migrated_at": pos,
+            "samples_seen": state["samples_seen"]}})
+    rt.process([0.2, 0, 0, 0], session_id="s", position=0)
+    before = copy.deepcopy(rt.sessions["s"])
+    preview = preview_switch(before, "group:wide", 1, rt.policy,
+                             rt.migrations)
+    assert preview["action"] == "retain-min-hold"
+    assert preview["previous_output_positions"] == [0]
+    assert rt.sessions["s"] == before
+    result = rt.process([0.8, 0.8, 0, 0], session_id="s", position=2)
+    assert result["switch"]["action"] == "migrate"
+    assert result["switch"]["compatible"] is True
+    assert rt.sessions["s"]["state"]["migrated_at"] == 2
+
+
+def test_active_sessions_count_loaded_plans_and_idle_state_storage():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"state_bits_per_session": 64},
+        runtime_storage_budget=1400)
+    _add_edge_plan(dep)
+    rt = SessionDeploymentRuntime(dep)
+    r1 = rt.process([0.8, 0.8, 0, 0], session_id="wide-session", position=0)
+    assert r1["storage"]["total_bits"] == 848 + 64
+    r2 = rt.process([0.8, 0.8, 0, 0], session_id="same-plan", position=3)
+    assert r2["storage"]["loaded_shared_plan_bits"] == 848
+    assert r2["storage"]["active_session_state_bits"] == 128
+    assert r2["storage"]["budget_satisfied"]
+    blocked = rt.process([0.95, 0.95, 0.95, 0.95],
+                         session_id="edge-session", position=9)
+    assert blocked["plan"] == "unified"
+    assert blocked["assignment"]["status"] == "storage-blocked-fallback"
+    assert blocked["assignment"]["requested_plan"] == "group:edge"
+
+
+def test_short_stream_storage_blocked_switch_is_retained_not_rewritten():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"state_bits_per_session": 100},
+        runtime_storage_budget=1000)
+    _add_edge_plan(dep, state_bits=200)
+    rt = SessionDeploymentRuntime(dep)
+    rt.process([0.8, 0.8, 0, 0], session_id="s", position=0)
+    blocked = rt.process([0.95, 0.95, 0.95, 0.95], session_id="s",
+                         position=1)
+    assert blocked["plan"] == "group:wide"
+    assert blocked["assignment"]["status"] == "storage-blocked-retain"
+    assert blocked["switch"]["reason"] == "storage-budget-exceeded"
+    assert rt.sessions["s"]["switches"] == []
+
+
+def test_session_artifact_roundtrip_continues_same_path(tmp_path):
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"min_hold_inputs": 2},
+        runtime_storage_budget=100000)
+    _add_edge_plan(dep)
+    rt = SessionDeploymentRuntime(dep)
+    first = rt.process([0.8, 0.8, 0, 0], session_id="s", position=0)
+    M.save_deployment(tmp_path / "sessions.json", rt.to_dict())
+    loaded_doc = M.load_deployment(tmp_path / "sessions.json")
+    rt2 = SessionDeploymentRuntime.from_dict(loaded_doc)
+    retained = rt2.process([0.8, 0.8, 0, 0], session_id="s", position=1)
+    held_until_after_retained = rt2.sessions["s"]["held_until"]
+    switched = rt2.process([0.2, 0, 0, 0], session_id="s", position=3)
+    assert retained["plan"] == "group:wide"
+    assert retained["assignment"]["status"] == "matched"
+    assert held_until_after_retained == 2
+    assert switched["plan"] == "unified"
+    assert switched["switch"]["restart_position"] == 3
+    assert np.array_equal(switched["output"], first["output"]) is False
+
+
+def test_strategy_comparison_reports_uncovered_independent_and_stateful():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"min_hold_inputs": 1},
+        runtime_storage_budget=100000)
+    _add_edge_plan(dep)
+    stream = np.array([[0.2, 0, 0, 0], [0.8, 0.8, 0, 0],
+                       [0.2, 0, 0, 0], [2.0, 0, 0, 0]])
+    rep = compare_session_selection_strategies(
+        dep, {"a": stream})
+    assert rep["unified"]["a"]["plan"] == "unified"
+    assert [a["plan"] for a in rep["independent"]["a"]["assignments"]] \
+        == ["unified", "group:wide", "unified", "unified"]
+    assert [d["plan"] for d in rep["stateful"]["a"]["decisions"]] == [
+        "unified", "group:wide", "unified", "unified"]
+    assert rep["independent"]["a"]["assignments"][3]["status"] == \
+        "uncovered"
+
+
+def test_changing_hold_rule_invalidates_saved_session_policy():
+    layers, groups, conditions = _routed_setup()
+    dep = build_grouped_deployment(
+        layers, groups, conditions, tol_max_abs=0.02,
+        session_policy={"min_hold_inputs": 2})
+    assert validate_policy_fingerprint(
+        dep, groups, conditions, {"min_hold_inputs": 2})
+    with pytest.raises(PrecisionRouteError):
+        validate_policy_fingerprint(
+            dep, groups, conditions, {"min_hold_inputs": 3})

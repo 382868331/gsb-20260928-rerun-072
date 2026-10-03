@@ -18,6 +18,9 @@
 - edgequant/deployment.py 统一回退方案 + 按输入组独立校准的候选精度方案；
                           预算只允许容纳部分候选时按改善/额外存储预先选择；
                           产物记录实际路径、逐组误差、共同占用存储与边界结果
+- edgequant/sessions.py  有状态会话运行时：按当前已见输入执行冻结规则，
+                          支持最短保持、显式状态迁移或在边界重启；预算计入
+                          已载入共享方案和仍活跃会话状态，重开后沿原路径继续
 - edgequant/runner.py    独立运行器：只吃转换产物 JSON，纯整数推理；
                           逐层报告输入截断/激活饱和/int32 累加溢出与风险标记
 - edgequant/evaluate.py  逐层 max_abs_err/RMSE/SQNR + 风险；boundary_check
@@ -56,9 +59,18 @@
   情况的实际 plan 都是 route_policy 中声明的 fallback_plan（默认 unified）
 - 共同存储：统一回退方案的完整权重计入一次，每个入选分组方案完整计入；
   不对不同方案间的权重或 scale 做去重，总存储超过预算则该候选不入选
+- 会话切换：切换只依据当前输入命中的冻结条件，不查看未来输入或事后误差。
+  min_hold_inputs 内跨组请求保留当前方案；没有显式迁移器时，旧内部状态
+  不声称可延续，新方案从 restart_position 重新初始化，旧输出位置仍归属
+  旧方案。会话运行预算常驻统一回退，叠加已载入分组方案和全部活跃会话
+  状态；即使会话暂时没有新输入，只要未结束就继续计入 state bits。
+- 三策略比较：统一方案始终跑 fallback；每次独立选组为每条输入初始化并
+  立即释放状态；保留会话状态则记录 switches/lineage/rejections 与每次预算
+  快照，三种结果均不能被后续误差反向改路。
 - 校准证明范围：保存 policy_sha256_16，内容包括分组样本、容差和条件。
   修改条件边界或分组样本后，verify_deployment 会拒绝沿用旧产物，必须重新
-  校准生成新证明
+  校准生成新证明；修改 min_hold_inputs、状态位等会话保持/切换规则同样使
+  旧指纹失效，因为新切换路径需要新的比较依据
 - 重载复核：reverify 只吃转换产物 JSON，重新预测并逐层核对与产物记录
   逐元素一致；越界输入必须报告输入裁剪、激活饱和/累加溢出与风险；
   provenance 保留旧方案限制（容差/预算）、校准来源路径与校准内容指纹
@@ -93,3 +105,9 @@ group:<name> 完整方案；route_policy.rules 保存条件、顺序、实际 pl
 未入选原因；storage 保存统一方案比特、各入选方案比特、共同占用总量和
 预算；deployment_report 保存每组统一/分组误差与新增存储改善。复合产物
 也可直接传给 run_quant，返回风险中的 route_assignments 可供逐样本审计。
+
+会话运行时在部署产物内附加 edgequant.session-runtime.v1：session_policy
+保存最短保持与每会话状态位；sessions 保存当前 plan、held_until、state、
+switches、rejections、state_lineage 和旧输出位置。调用 to_dict() 保存后，
+SessionDeploymentRuntime.from_dict() 重开会沿用同一 held_until 与 lineage，
+不会重新选择“事后更好”的历史路径。
