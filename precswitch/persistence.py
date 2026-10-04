@@ -24,6 +24,8 @@ def save_artifact(engine: Engine, path: str) -> None:
                 "scheme": s.scheme.name,
                 "group": s.group,
                 "state": s.state,
+                "migrating_state": s.migrating_state,
+                "pending_target": s.pending_target,
                 "inputs_since_switch": s.inputs_since_switch,
                 "outputs": s.outputs,
                 "old_scheme_outputs": s.old_scheme_outputs,
@@ -85,16 +87,28 @@ def load_artifact(
             scheme=scheme,
             group=s["group"],
             state=s["state"],
+            migrating_state=s.get("migrating_state"),
+            pending_target=s.get("pending_target"),
             inputs_since_switch=s["inputs_since_switch"],
             outputs=list(s["outputs"]),
             old_scheme_outputs=list(s["old_scheme_outputs"]),
         )
         engine.sessions[sid] = sess
         if budget is not None:
-            budget.session_started(sid, scheme)
+            if sess.pending_switch:
+                # A switch was interrupted before commit: the migration
+                # peak was genuinely retained and must be rebuilt exactly.
+                target = schemes_by_name[sess.pending_target]
+                # session_started accounts for the old state; register the
+                # pending pair first so the target pin survives, then pin
+                # the target's shared load and add the new state's cost.
+                budget.session_started(sid, scheme)
+                budget._pending[sid] = (scheme, target)
+                budget._retain(target)
+            else:
+                budget.session_started(sid, scheme)
     for h in data["history"]:
         engine.history.append(StepResult(
             h["session_id"], h["position"], Outcome(h["outcome"]), h["scheme"], h["group"],
         ))
     return engine
-
