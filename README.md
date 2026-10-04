@@ -13,11 +13,11 @@
 - 因果切换：位置 i 的决策只用输入 0..i 与固定规则；API 不存在按后来误差回选历史路径的入口（test_causal_decisions_only 用相同前缀验证决策一致）。
 - 切换预览（preview.py）：说明能否延续（can_continue）、不能延续时必须从哪个明确位置重启（restart_at）、哪些先前输出仍基于旧方案（old_scheme_outputs）。状态无法被当前方案解释时抛 UnexplainableStateError，不允许无声丢状态后声称连续推断。
 - 状态不可互换：StateKind 区分 STATELESS / COMPATIBLE（经 migrator 迁移）/ INCOMPATIBLE。不可迁移时引擎给出显式 ROLLED_BACK，保留旧方案与旧状态。
-- 预算（budget.py）：共享的已载入方案成本只计一次；每个活跃会话的状态成本持续计入，暂时没有新输入也不豁免（test_idle_session_still_counts）。
+- 预算（budget.py）：共享的已载入方案成本只计一次（引用计数，最后一个使用者退出才释放）；每个活跃会话的持久状态成本持续计入，暂时没有新输入也不豁免（test_idle_session_still_counts）。方案切换走 begin/commit/abort 预留协议：资格检查同时核算稳态占用（新持久状态替换旧状态）与迁移峰值（新旧状态暂时并存、目标共享负载已载入）；预算不足时抛 BudgetDeniedError，旧方案与旧状态原样保留。迁移中途可保存（pending_switches），重开时按真实保留资源重新预留，可继续提交或取消；迁移函数失败只释放候选预留并显式 SWITCH_FAILED。
 - 校准边界（calibration.py）：校准绑定分组规则版本与保持规则版本；改变分组条件或保持规则后查询旧校准范围抛 CalibrationError，原范围不给新切换路径背书。
 - 持久化（persistence.py）：完整产物（会话、状态、历史、规则/策略版本、预算）保存后重开，按原会话路径延续；规则版本变化拒绝载入。
 
-## 核对场景（tests/，42 个用例）
+## 核对场景（tests/，49 个用例）
 
 - 往返跨组：min_hold 大时全部 HELD_BY_MIN_HOLD；min_hold=1 时可见抖动且不可迁移处显式回退。
 - 规则切换时仍有活跃会话：切换预览列出旧方案输出位置，状态迁移或显式重启位置。
@@ -25,8 +25,8 @@
 - 未覆盖输入：UNCOVERED_INPUT 显式结果，流继续。
 - 无法迁移状态：ROLLED_BACK + 预览说明；无法解释状态抛错。
 - 回退选择：预算不足或状态不可迁移时均记录显式回退而非静默处理。
+- 切换资源依据（test_switch_budget.py）：持久状态未计入时的 30+100>50 拒绝、迁移峰值保护（稳态可行但峰值超限）、释放共享负载后重试成功、取消候选仅释放预留且另一候选复用已载入共享、迁移失败恢复、迁移中途保存重开后提交/取消的完整轨迹；已发生的 SWITCH_RESERVED 历史不被重新解释。
 
 ## 运行
 
     python3 -m pytest tests -q
-

@@ -27,6 +27,8 @@ def save_artifact(engine: Engine, path: str) -> None:
                 "inputs_since_switch": s.inputs_since_switch,
                 "outputs": s.outputs,
                 "old_scheme_outputs": s.old_scheme_outputs,
+                "migrating_to": s.migrating_to,
+                "pending_state": s.pending_state,
             }
             for sid, s in engine.sessions.items()
         },
@@ -40,7 +42,18 @@ def save_artifact(engine: Engine, path: str) -> None:
             }
             for h in engine.history
         ],
-        "budget": None if engine.budget is None else {"limit": engine.budget.limit},
+        "budget": None if engine.budget is None else {
+            "limit": engine.budget.limit,
+            "pending_switches": [
+                {
+                    "session_id": sid,
+                    "target": pending["target"].name,
+                    "group": pending["group"],
+                    "position": pending["position"],
+                }
+                for sid, pending in getattr(engine, "_pending", {}).items()
+            ],
+        },
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -88,13 +101,29 @@ def load_artifact(
             inputs_since_switch=s["inputs_since_switch"],
             outputs=list(s["outputs"]),
             old_scheme_outputs=list(s["old_scheme_outputs"]),
+            migrating_to=s.get("migrating_to"),
+            pending_state=s.get("pending_state"),
         )
         engine.sessions[sid] = sess
         if budget is not None:
             budget.session_started(sid, scheme)
+    pending_map = {}
+    if budget is not None:
+        for p in (data["budget"] or {}).get("pending_switches", []):
+            # Re-reserve exactly the resources retained mid-migration:
+            # the old session stays active while the target's shared load
+            # and new persistent state count until commit/abort.
+            target = schemes_by_name[p["target"]]
+            reservation = budget.begin_switch(p["session_id"], target)
+            pending_map[p["session_id"]] = {
+                "target": target, "group": p["group"],
+                "position": p["position"], "reservation": reservation,
+                "preview": None,
+            }
+    if pending_map:
+        engine._pending = pending_map
     for h in data["history"]:
         engine.history.append(StepResult(
             h["session_id"], h["position"], Outcome(h["outcome"]), h["scheme"], h["group"],
         ))
     return engine
-
