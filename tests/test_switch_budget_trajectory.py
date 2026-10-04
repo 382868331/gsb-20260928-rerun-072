@@ -69,6 +69,36 @@ def test_persistent_state_counts_in_switch_eligibility(rule):
     assert budget.report().total == 40
 
 
+def test_peak_only_rejection_names_real_blocker(rule):
+    # Steady footprint fits, only the migration peak breaches: the message
+    # must name the temporary coexistence rather than calling both figures
+    # exceeded.
+    a, b, _ = build_schemes()
+    # a load 20 + state 10 fits; target b state 100: steady = 10+100 = 110;
+    # peak adds the new state and b's load on top of the old footprint:
+    # 30 + 100 + 10 = 140.
+    budget = Budget(limit=120)
+    group_schemes = {"cold": a, "hot": b}
+    eng = engine(rule, group_schemes, budget)
+    eng.feed(InputEvent("s", 0, 1))
+
+    projection = budget.project_switch("s", b)
+    assert projection.steady_total == 110  # fits within 120
+    assert projection.peak_total == 140    # does not
+    assert not projection.fits
+    assert not projection.steady_exceeded and projection.peak_exceeded
+
+    r = eng.feed(InputEvent("s", 1, -1))
+    assert r.outcome is Outcome.ROLLED_BACK
+    detail = r.detail
+    assert "steady footprint 110 fits within budget 120" in detail
+    assert "migration peak 140" in detail
+    assert "temporary coexistence" in detail
+    assert "not the steady-state footprint" in detail
+    assert "110 and the migration peak 140 exceed" not in detail
+    assert budget.report().total == 30  # nothing reserved, old state usable
+
+
 def test_release_then_retry_succeeds(rule):
     a, b, _ = build_schemes()
     budget = Budget(limit=240)
@@ -150,6 +180,13 @@ def test_interrupted_migration_save_reopen_cancel_and_resume(tmp_path, rule):
     assert r.outcome is Outcome.SWITCHED_RESTARTED
     sess = eng.sessions["s"]
     assert sess.pending_switch
+    candidate_id = "s@1->b"
+    assert sess.candidate_id == candidate_id
+    # Reservation and in-flight migration are separately traceable facts.
+    assert [h.outcome for h in eng.history[-2:]] == [
+        Outcome.SWITCH_RESERVED, Outcome.SWITCHED_RESTARTED,
+    ]
+    assert all(h.candidate_id == candidate_id for h in eng.history[-2:])
     # migration peak: a(20) + b(10) shared; states a(10) + b(100) + b(100)
     assert budget.report().total == 240
     # The historical, already-completed switch is not reinterpreted.
@@ -158,6 +195,7 @@ def test_interrupted_migration_save_reopen_cancel_and_resume(tmp_path, rule):
 
     eng2 = load_artifact(path, rule, group_schemes)
     assert eng2.sessions["s"].pending_target == "b"
+    assert eng2.sessions["s"].candidate_id == candidate_id
     assert eng2.budget.report().total == 240  # real retained resources
 
     # While the peak is held, an even bigger candidate cannot sneak in.
@@ -165,19 +203,118 @@ def test_interrupted_migration_save_reopen_cancel_and_resume(tmp_path, rule):
     assert not eng2.budget.project_switch("b-user", big).fits
 
     # Cancel the candidate: only the old scheme/state remain, stream continues.
-    eng2.cancel_pending_switch("s")
+    cancel_result = eng2.cancel_pending_switch("s")
+    assert cancel_result.outcome is Outcome.SWITCH_CANCELLED
+    assert cancel_result.candidate_id == candidate_id
     assert eng2.sessions["s"].scheme.name == "a"
     assert eng2.sessions["s"].state["scheme"] == "a"
+    # A cancellation is its own fact and must never look like completion.
+    assert eng2.history[-1].outcome is Outcome.SWITCH_CANCELLED
+    assert eng2.history[-1].scheme == "a"
+    assert eng2.history[-1].candidate_id == candidate_id
+    assert eng2.sessions["s"].last_candidate_id == candidate_id
+    # Repeating the cancel does not append another fact and does not switch.
+    with pytest.raises(ValueError):
+        eng2.cancel_pending_switch("s")
+    assert eng2.sessions["s"].scheme.name == "a"
+    assert [h.outcome for h in eng2.history].count(Outcome.SWITCH_CANCELLED) == 1
     assert eng2.budget.report().total == 20 + 10 + 10 + 100
     r2 = eng2.feed(InputEvent("s", 2, -2))
     assert r2.outcome is Outcome.SWITCHED_CONTINUED and r2.scheme == "b"
+    # A genuinely new attempt gets a distinct candidate identity.
+    assert r2.candidate_id == "s@2->b"
 
     # Reopen the original mid-flight artifact again and this time resume it.
     eng3 = load_artifact(path, rule, group_schemes)
-    eng3.resume_pending_switch("s")
+    commit_result = eng3.resume_pending_switch("s")
+    assert commit_result.outcome is Outcome.SWITCH_COMMITTED
+    assert commit_result.candidate_id == candidate_id
     assert eng3.sessions["s"].scheme.name == "b"
     assert eng3.sessions["s"].state["scheme"] == "b"
     # steady: a released (s was its last user), b shared by two sessions
     assert eng3.budget.report().total == 10 + 200
-    # history recorded at switch time is preserved, not rewritten on resume
-    assert eng3.history[2].outcome is Outcome.SWITCHED_RESTARTED
+    # Facts recorded at switch time are preserved, not rewritten on resume;
+    # the later commit is appended and attributed to the same candidate.
+    assert [h.outcome for h in eng3.history[2:4]] == [
+        Outcome.SWITCH_RESERVED, Outcome.SWITCHED_RESTARTED,
+    ]
+    assert eng3.history[-1].outcome is Outcome.SWITCH_COMMITTED
+    assert eng3.history[-1].candidate_id == candidate_id
+    with pytest.raises(ValueError):
+        eng3.resume_pending_switch("s")
+
+
+def _history_for(engine, session_id):
+    return [h for h in engine.history if h.session_id == session_id]
+
+
+def test_two_sessions_shared_target_cancel_and_commit_ledger(tmp_path, rule):
+    """Two sessions sharing a target load: save both mid-flight, then in
+    two reopened engines cancel one candidate and commit the other. The
+    resource ledger must match exactly the facts appended to history."""
+    from precswitch import load_artifact, save_artifact
+
+    a, b, _ = build_schemes()
+    budget = Budget(limit=400)
+    group_schemes = {"cold": a, "hot": b}
+    eng = engine(rule, group_schemes, budget, interrupt_before_commit=True)
+    eng.feed(InputEvent("s1", 0, 1))
+    eng.feed(InputEvent("s2", 0, 1))
+    # A third session keeps b's shared load independently of the candidates.
+    eng.feed(InputEvent("b-user", 0, -9))
+
+    r1 = eng.feed(InputEvent("s1", 1, -1))
+    r2 = eng.feed(InputEvent("s2", 1, -1))
+    assert r1.outcome is r2.outcome is Outcome.SWITCHED_RESTARTED
+    assert eng.sessions["s1"].candidate_id == "s1@1->b"
+    assert eng.sessions["s2"].candidate_id == "s2@1->b"
+    # Peak held twice, b load shared once:
+    # shared a(20)+b(10); states b-user(100)+s1(a10+b100)+s2(a10+b100) = 320
+    assert budget.report().total == 350
+    path = str(tmp_path / "two.json")
+    save_artifact(eng, path)
+
+    # Session A engine: cancel s1's candidate.
+    eng_cancel = load_artifact(path, rule, group_schemes)
+    assert eng_cancel.budget.report().total == 350
+    cr = eng_cancel.cancel_pending_switch("s1")
+    assert cr.candidate_id == "s1@1->b"
+    # Released: s1's built b state (100). Shared loads unchanged: s1 keeps
+    # a, s2 is still pending on both, b-user keeps b. states 220 + 30.
+    assert eng_cancel.budget.report().total == 250
+    s1_facts = [h.outcome for h in _history_for(eng_cancel, "s1")]
+    assert s1_facts == [
+        Outcome.EMITTED,
+        Outcome.SWITCH_RESERVED,
+        Outcome.SWITCHED_RESTARTED,
+        Outcome.SWITCH_CANCELLED,
+    ]
+    assert all(
+        h.candidate_id == "s1@1->b"
+        for h in _history_for(eng_cancel, "s1")[1:]
+    )
+    assert eng_cancel.sessions["s1"].scheme.name == "a"
+    # s2's candidate is untouched in this engine.
+    assert eng_cancel.sessions["s2"].candidate_id == "s2@1->b"
+
+    # Session B engine: commit s2's candidate.
+    eng_commit = load_artifact(path, rule, group_schemes)
+    rr = eng_commit.resume_pending_switch("s2")
+    assert rr.candidate_id == "s2@1->b"
+    # s2's a state (10) is released; a load stays because s1 is still
+    # pending with old scheme a. states: 100 + (10+100) + 100 = 310 + 30.
+    assert eng_commit.budget.report().total == 340
+    s2_facts = [h.outcome for h in _history_for(eng_commit, "s2")]
+    assert s2_facts == [
+        Outcome.EMITTED,
+        Outcome.SWITCH_RESERVED,
+        Outcome.SWITCHED_RESTARTED,
+        Outcome.SWITCH_COMMITTED,
+    ]
+    assert eng_commit.sessions["s2"].scheme.name == "b"
+    assert eng_commit.sessions["s2"].state["scheme"] == "b"
+    # No cancellation fact exists for s2 and no commit fact for s1.
+    assert Outcome.SWITCH_COMMITTED not in [
+        h.outcome for h in _history_for(eng_commit, "s1")]
+    assert Outcome.SWITCH_CANCELLED not in [
+        h.outcome for h in _history_for(eng_commit, "s2")]

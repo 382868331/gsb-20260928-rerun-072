@@ -26,6 +26,9 @@ def save_artifact(engine: Engine, path: str) -> None:
                 "state": s.state,
                 "migrating_state": s.migrating_state,
                 "pending_target": s.pending_target,
+                "pending_position": s.pending_position,
+                "candidate_id": s.candidate_id,
+                "last_candidate_id": s.last_candidate_id,
                 "inputs_since_switch": s.inputs_since_switch,
                 "outputs": s.outputs,
                 "old_scheme_outputs": s.old_scheme_outputs,
@@ -39,6 +42,7 @@ def save_artifact(engine: Engine, path: str) -> None:
                 "outcome": h.outcome.value,
                 "scheme": h.scheme,
                 "group": h.group,
+                "candidate_id": h.candidate_id,
             }
             for h in engine.history
         ],
@@ -89,6 +93,9 @@ def load_artifact(
             state=s["state"],
             migrating_state=s.get("migrating_state"),
             pending_target=s.get("pending_target"),
+            pending_position=s.get("pending_position"),
+            candidate_id=s.get("candidate_id"),
+            last_candidate_id=s.get("last_candidate_id"),
             inputs_since_switch=s["inputs_since_switch"],
             outputs=list(s["outputs"]),
             old_scheme_outputs=list(s["old_scheme_outputs"]),
@@ -110,5 +117,6 @@ def load_artifact(
     for h in data["history"]:
         engine.history.append(StepResult(
             h["session_id"], h["position"], Outcome(h["outcome"]), h["scheme"], h["group"],
+            candidate_id=h.get("candidate_id"),
         ))
     return engine

@@ -36,6 +36,45 @@ class SwitchProjection:
     def blocking_total(self) -> int:
         return max(self.steady_total, self.peak_total)
 
+    @property
+    def steady_exceeded(self) -> bool:
+        return self.steady_total > self.limit
+
+    @property
+    def peak_exceeded(self) -> bool:
+        return self.peak_total > self.limit
+
+    def describe_block(self) -> str:
+        """Name the resource that actually blocks the switch.
+
+        When the steady footprint fits but the migration peak does not,
+        the steady figure must not be reported as exceeded: the blocker is
+        the temporary coexistence of the old state (and possibly the old
+        shared load) with the already-built new state and target load.
+        """
+        if not self.steady_exceeded and self.peak_exceeded:
+            return (
+                "steady footprint %d fits within budget %d, but the "
+                "migration peak %d exceeds it; the blocking resource is the "
+                "temporary coexistence during migration (old state retained "
+                "while the new state is already built, plus the overlapping "
+                "shared scheme loads), not the steady-state footprint"
+                % (self.steady_total, self.limit, self.peak_total)
+            )
+        if self.steady_exceeded and not self.peak_exceeded:
+            return (
+                "migration peak %d fits within budget %d, but the steady "
+                "footprint %d after the switch exceeds it; the blocking "
+                "resource is the target scheme's persistent steady-state "
+                "cost"
+                % (self.peak_total, self.limit, self.steady_total)
+            )
+        return (
+            "both the steady footprint %d and the migration peak %d exceed "
+            "budget %d"
+            % (self.steady_total, self.peak_total, self.limit)
+        )
+
 
 class Budget:
     """Accounts memory as shared loaded schemes plus per-active-session state.
@@ -168,7 +207,4 @@ class BudgetExceeded(Exception):
 
     def __init__(self, projection: SwitchProjection):
         self.projection = projection
-        super().__init__(
-            "switch needs %d steady / %d peak bits but budget is %d"
-            % (projection.steady_total, projection.peak_total, projection.limit)
-        )
+        super().__init__(projection.describe_block())
