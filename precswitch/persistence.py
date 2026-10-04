@@ -19,6 +19,7 @@ def save_artifact(engine: Engine, path: str) -> None:
         "rule_version": engine.rule.version,
         "policy": {"min_hold": engine.policy.min_hold, "version": engine.policy.version},
         "uniform_scheme": engine.uniform_scheme.name,
+        "next_candidate_id": engine._next_candidate_id,
         "sessions": {
             sid: {
                 "scheme": s.scheme.name,
@@ -26,6 +27,9 @@ def save_artifact(engine: Engine, path: str) -> None:
                 "state": s.state,
                 "migrating_state": s.migrating_state,
                 "pending_target": s.pending_target,
+                "candidate_id": s.candidate_id,
+                "resolved_candidate": s.resolved_candidate,
+                "last_position": s.last_position,
                 "inputs_since_switch": s.inputs_since_switch,
                 "outputs": s.outputs,
                 "old_scheme_outputs": s.old_scheme_outputs,
@@ -82,6 +86,7 @@ def load_artifact(
 
     for sid, s in data["sessions"].items():
         scheme = schemes_by_name[s["scheme"]]
+        resolved = s.get("resolved_candidate")
         sess = _Session(
             session_id=sid,
             scheme=scheme,
@@ -89,6 +94,9 @@ def load_artifact(
             state=s["state"],
             migrating_state=s.get("migrating_state"),
             pending_target=s.get("pending_target"),
+            candidate_id=s.get("candidate_id"),
+            resolved_candidate=tuple(resolved) if resolved else None,
+            last_position=s.get("last_position", 0),
             inputs_since_switch=s["inputs_since_switch"],
             outputs=list(s["outputs"]),
             old_scheme_outputs=list(s["old_scheme_outputs"]),
@@ -111,4 +119,5 @@ def load_artifact(
         engine.history.append(StepResult(
             h["session_id"], h["position"], Outcome(h["outcome"]), h["scheme"], h["group"],
         ))
+    engine._next_candidate_id = data.get("next_candidate_id", 1)
     return engine

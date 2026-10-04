@@ -26,6 +26,11 @@ class Outcome(enum.Enum):
     SWITCH_FAILED = "switch_failed"        # migration broke mid-way; old scheme kept
     UNCOVERED_INPUT = "uncovered_input"    # grouping rule does not cover this input
     BUDGET_DENIED = "budget_denied"        # not enough memory to run this input
+    # Lifecycle of a two-phase switch candidate, recorded as separate facts
+    # so a saved-and-reopened migration stays traceable to its real ending:
+    SWITCH_RESERVED = "switch_reserved"    # migration peak reserved, old state untouched
+    SWITCH_COMMITTED = "switch_committed"  # pending candidate confirmed effective
+    SWITCH_CANCELLED = "switch_cancelled"  # pending candidate abandoned, old scheme kept
 
 
 class MigrationFailed(Exception):
@@ -60,6 +65,12 @@ class _Session:
     # ``state`` and the already-built new state in ``migrating_state`` coexist.
     migrating_state: object = None
     pending_target: Optional[str] = None
+    last_position: int = 0
+    # Identity of the in-flight (or most recently resolved) switch
+    # candidate. Resolution is recorded once; repeated resume/cancel calls
+    # for the same candidate are no-ops and append no history.
+    candidate_id: Optional[int] = None
+    resolved_candidate: Optional[tuple] = None  # (candidate_id, \"committed\"|\"cancelled\")
 
     @property
     def pending_switch(self) -> bool:
@@ -96,12 +107,16 @@ class Engine:
         }
         self.sessions: Dict[str, _Session] = {}
         self.history: List[StepResult] = []
+        self._next_candidate_id = 1
         if budget is not None and mode is Mode.UNIFORM:
             budget.load_scheme(self.uniform_scheme)
 
     # -- public API -----------------------------------------------------
 
     def feed(self, event: InputEvent) -> StepResult:
+        sess = self.sessions.get(event.session_id)
+        if sess is not None:
+            sess.last_position = event.position
         try:
             group = self.rule.group_of(event.payload)
         except UncoveredInputError as exc:
@@ -122,17 +137,50 @@ class Engine:
 
     def resume_pending_switch(self, session_id: str) -> None:
         """Commit a switch left in flight before a save/reopen."""
-        sess = self._require_pending(session_id)
+        sess = self.sessions.get(session_id)
+        if sess is None:
+            raise ValueError("session %s has no in-flight switch" % session_id)
+        if not sess.pending_switch:
+            if sess.resolved_candidate is not None:
+                # Same candidate already resolved: keep its identity, do
+                # not append history for a change that did not happen.
+                return
+            raise ValueError("session %s has no in-flight switch" % session_id)
         target = self.schemes_by_name[sess.pending_target]
+        candidate_id = sess.candidate_id
         self._commit_pending_switch(session_id, sess, target)
+        sess.resolved_candidate = (candidate_id, "committed")
+        self._record(StepResult(
+            session_id, sess.last_position, Outcome.SWITCH_COMMITTED,
+            target.name, sess.group,
+            detail="pending switch candidate %s confirmed effective; target "
+                   "scheme %s now runs the session" % (candidate_id, target.name),
+        ))
 
     def cancel_pending_switch(self, session_id: str) -> None:
         """Abandon a candidate: release its reservation, keep old state."""
-        sess = self._require_pending(session_id)
+        sess = self.sessions.get(session_id)
+        if sess is None:
+            raise ValueError("session %s has no in-flight switch" % session_id)
+        if not sess.pending_switch:
+            if sess.resolved_candidate is not None:
+                # Already resolved (committed or cancelled): a repeated
+                # cancel must not rewrite the candidate's real ending.
+                return
+            raise ValueError("session %s has no in-flight switch" % session_id)
+        candidate_id = sess.candidate_id
         if self.budget is not None:
             self.budget.cancel_switch(session_id)
         sess.migrating_state = None
         sess.pending_target = None
+        sess.resolved_candidate = (candidate_id, "cancelled")
+        self._record(StepResult(
+            session_id, sess.last_position, Outcome.SWITCH_CANCELLED,
+            sess.scheme.name, sess.group,
+            detail="pending switch candidate %s cancelled; reservation "
+                   "released, old scheme %s and old state retained"
+                   % (candidate_id, sess.scheme.name),
+        ))
 
     # -- modes ----------------------------------------------------------
 
@@ -222,17 +270,14 @@ class Engine:
                 return self._record(StepResult(
                     event.session_id, event.position, Outcome.ROLLED_BACK,
                     sess.scheme.name, group, preview=prev,
-                    detail="switch blocked: steady footprint %d and migration "
-                           "peak %d exceed budget %d; old scheme and state "
-                           "retained and remain usable"
-                           % (projection.steady_total, projection.peak_total,
-                              projection.limit),
+                    detail=self._blocked_detail(projection),
                 ))
 
         try:
             committed = self._perform_switch(
                 event.session_id, sess, target,
                 interrupt_before_commit=self.interrupt_before_commit,
+                position=event.position, group=group,
             )
         except MigrationFailed as exc:
             sess.outputs.append(event.position)
@@ -264,6 +309,7 @@ class Engine:
     def _perform_switch(
         self, session_id: str, sess: _Session, target: PrecisionScheme,
         interrupt_before_commit: bool = False,
+        position: int = 0, group: Optional[str] = None,
     ) -> bool:
         """Returns False when the switch is deliberately left in flight.
 
@@ -274,6 +320,15 @@ class Engine:
         source = sess.scheme
         if self.budget is not None:
             self.budget.begin_switch(session_id, target)
+        sess.candidate_id = self._next_candidate_id
+        self._next_candidate_id += 1
+        if self.budget is not None:
+            self._record(StepResult(
+                session_id, position, Outcome.SWITCH_RESERVED, target.name, group,
+                detail="migration peak reserved for switch candidate %s to "
+                       "scheme %s; old state untouched"
+                       % (sess.candidate_id, target.name),
+            ))
         try:
             new_state = source.migrate_state_to(target, sess.state)
         except Exception as exc:
@@ -305,11 +360,19 @@ class Engine:
 
     # -- helpers --------------------------------------------------------
 
-    def _require_pending(self, session_id: str) -> _Session:
-        sess = self.sessions.get(session_id)
-        if sess is None or not sess.pending_switch:
-            raise ValueError("session %s has no in-flight switch" % session_id)
-        return sess
+    @staticmethod
+    def _blocked_detail(projection) -> str:
+        # Name only the figures that actually exceed the limit; a steady
+        # footprint inside the budget is stated as fitting, not as a
+        # second blocker.
+        blocking = " and ".join(projection.blocking_parts())
+        note = ""
+        if projection.steady_total <= projection.limit:
+            note = " (steady footprint %d itself fits)" % projection.steady_total
+        return (
+            "switch blocked: %s exceed budget %d%s; old scheme and state "
+            "retained and remain usable" % (blocking, projection.limit, note)
+        )
 
     def _group_of_scheme(self, target: PrecisionScheme) -> str:
         for group, scheme in self.group_schemes.items():

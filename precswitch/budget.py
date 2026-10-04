@@ -36,6 +36,17 @@ class SwitchProjection:
     def blocking_total(self) -> int:
         return max(self.steady_total, self.peak_total)
 
+    def blocking_parts(self) -> Tuple[str, ...]:
+        """Only the figures that actually exceed the limit. When steady
+        fits and only the migration peak overflows, the steady footprint is
+        not named as a blocker."""
+        parts = []
+        if self.steady_total > self.limit:
+            parts.append("steady footprint %d" % self.steady_total)
+        if self.peak_total > self.limit:
+            parts.append("migration peak %d" % self.peak_total)
+        return tuple(parts)
+
 
 class Budget:
     """Accounts memory as shared loaded schemes plus per-active-session state.
@@ -169,6 +180,6 @@ class BudgetExceeded(Exception):
     def __init__(self, projection: SwitchProjection):
         self.projection = projection
         super().__init__(
-            "switch needs %d steady / %d peak bits but budget is %d"
-            % (projection.steady_total, projection.peak_total, projection.limit)
+            "switch blocked: %s exceed budget %d"
+            % (" and ".join(projection.blocking_parts()), projection.limit)
         )

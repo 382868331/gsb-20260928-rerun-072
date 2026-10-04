@@ -169,6 +169,13 @@ def test_interrupted_migration_save_reopen_cancel_and_resume(tmp_path, rule):
     assert eng2.sessions["s"].scheme.name == "a"
     assert eng2.sessions["s"].state["scheme"] == "a"
     assert eng2.budget.report().total == 20 + 10 + 10 + 100
+    # the cancellation is its own fact, not a completed switch
+    assert eng2.history[-1].outcome is Outcome.SWITCH_CANCELLED
+    assert eng2.history[-1].scheme == "a"
+    assert not any(
+        h.outcome is Outcome.SWITCH_COMMITTED and h.session_id == "s"
+        for h in eng2.history
+    )
     r2 = eng2.feed(InputEvent("s", 2, -2))
     assert r2.outcome is Outcome.SWITCHED_CONTINUED and r2.scheme == "b"
 
@@ -179,5 +186,92 @@ def test_interrupted_migration_save_reopen_cancel_and_resume(tmp_path, rule):
     assert eng3.sessions["s"].state["scheme"] == "b"
     # steady: a released (s was its last user), b shared by two sessions
     assert eng3.budget.report().total == 10 + 200
-    # history recorded at switch time is preserved, not rewritten on resume
-    assert eng3.history[2].outcome is Outcome.SWITCHED_RESTARTED
+    # reservation, migration in flight and confirmation are separate facts
+    assert eng3.history[2].outcome is Outcome.SWITCH_RESERVED
+    assert eng3.history[3].outcome is Outcome.SWITCHED_RESTARTED
+    assert eng3.history[-1].outcome is Outcome.SWITCH_COMMITTED
+    assert eng3.history[-1].scheme == "b"
+    # repeated resume/cancel keep the same candidate identity: no new history
+    depth = len(eng3.history)
+    eng3.resume_pending_switch("s")
+    eng3.cancel_pending_switch("s")
+    assert len(eng3.history) == depth
+    assert eng3.sessions["s"].scheme.name == "b"
+
+
+def test_steady_fits_but_peak_overflows_names_only_the_peak(rule):
+    # steady footprint inside the budget must not be reported as over.
+    a = PrecisionScheme("a", StateKind.COMPATIBLE, load_cost=20, state_cost=10)
+    d = PrecisionScheme("d", StateKind.COMPATIBLE, load_cost=5, state_cost=60)
+    a.migrators["d"] = lambda st: {"scheme": "d", "history": list(st["history"])}
+    d.migrators["a"] = lambda st: {"scheme": "a", "history": list(st["history"])}
+    budget = Budget(limit=140)
+    group_schemes = {"cold": a, "hot": d}
+    eng = engine(rule, group_schemes, budget)
+    eng.feed(InputEvent("s", 0, 1))
+    budget.session_started("neighbour", d)  # d's shared load already paid
+    assert budget.report().total == 20 + 5 + 10 + 60
+
+    projection = budget.project_switch("s", d)
+    assert projection.steady_total == 125 <= 140  # steady fits
+    assert projection.peak_total == 155 > 140     # only the peak blocks
+
+    r = eng.feed(InputEvent("s", 1, -1))
+    assert r.outcome is Outcome.ROLLED_BACK
+    assert "migration peak 155" in r.detail
+    assert "steady footprint 125 itself fits" in r.detail
+    assert "steady footprint 125 exceed" not in r.detail
+    assert eng.sessions["s"].scheme.name == "a"
+
+
+def test_shared_target_load_commit_and_cancel_after_reopen(tmp_path, rule):
+    # Two sessions reserve switches into the same target scheme (shared load
+    # paid once); after save/reopen one candidate is confirmed, the other
+    # cancelled. Ledger and history must tell the same story.
+    from precswitch import load_artifact, save_artifact
+
+    a, b, _ = build_schemes()
+    budget = Budget(limit=400)
+    group_schemes = {"cold": a, "hot": b}
+    eng = engine(rule, group_schemes, budget, interrupt_before_commit=True)
+    eng.feed(InputEvent("s1", 0, 1))
+    eng.feed(InputEvent("s2", 0, 2))
+    r1 = eng.feed(InputEvent("s1", 1, -1))
+    r2 = eng.feed(InputEvent("s2", 1, -2))
+    assert r1.outcome is Outcome.SWITCHED_RESTARTED
+    assert r2.outcome is Outcome.SWITCHED_RESTARTED
+    # both candidates pending: shared a(20)+b(10); states a+a+b(100)+b(100)
+    assert budget.report().total == 30 + 220
+    path = str(tmp_path / "mid.json")
+    save_artifact(eng, path)
+
+    eng2 = load_artifact(path, rule, group_schemes)
+    assert eng2.budget.report().total == 250  # real retained peak rebuilt
+    eng2.resume_pending_switch("s1")
+    eng2.cancel_pending_switch("s2")
+    # s1 committed to b (b state 100, b shared 10); s2 back on a (shared 20,
+    # state 10); the cancelled candidate's reservation is fully released
+    assert eng2.sessions["s1"].scheme.name == "b"
+    assert eng2.sessions["s2"].scheme.name == "a"
+    assert eng2.sessions["s2"].state["scheme"] == "a"
+    assert eng2.budget.report().total == 10 + 20 + 100 + 10
+
+    # history: each candidate's ending recorded exactly once, no rewrite
+    committed = [h for h in eng2.history if h.outcome is Outcome.SWITCH_COMMITTED]
+    cancelled = [h for h in eng2.history if h.outcome is Outcome.SWITCH_CANCELLED]
+    assert [h.session_id for h in committed] == ["s1"]
+    assert [h.session_id for h in cancelled] == ["s2"]
+    assert committed[0].scheme == "b" and cancelled[0].scheme == "a"
+    reserved = [h for h in eng2.history if h.outcome is Outcome.SWITCH_RESERVED]
+    assert sorted(h.session_id for h in reserved) == ["s1", "s2"]
+
+    # repeated complete/cancel keep candidate identity: history unchanged
+    depth = len(eng2.history)
+    eng2.resume_pending_switch("s1")
+    eng2.cancel_pending_switch("s1")  # must not rewrite s1's committed ending
+    eng2.cancel_pending_switch("s2")
+    eng2.resume_pending_switch("s2")  # must not rewrite s2's cancelled ending
+    assert len(eng2.history) == depth
+    assert eng2.sessions["s1"].scheme.name == "b"
+    assert eng2.sessions["s2"].scheme.name == "a"
+    assert eng2.budget.report().total == 140
