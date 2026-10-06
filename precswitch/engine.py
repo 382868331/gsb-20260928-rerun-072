@@ -182,6 +182,32 @@ class Engine:
                    % (candidate_id, sess.scheme.name),
         ))
 
+    def begin_pending_switch(
+        self, session_id: str, target: PrecisionScheme
+    ) -> StepResult:
+        """Create and persist a half-finished migration candidate."""
+        sess = self.sessions[session_id]
+        if sess.pending_switch:
+            raise RuntimeError(
+                "session %s already has an in-flight switch" % session_id)
+        preview = preview_switch(
+            sess.scheme, target, sess.state, sess.last_position,
+            sess.old_scheme_outputs + sess.outputs,
+        )
+        if not preview.can_continue:
+            raise ValueError(preview.reason)
+        self._perform_switch(
+            session_id, sess, target, interrupt_before_commit=True,
+            position=sess.last_position, group=sess.group,
+        )
+        return self._record(StepResult(
+            session_id, sess.last_position, Outcome.SWITCHED_RESTARTED,
+            target.name, sess.group, preview=preview,
+            detail="joint migration candidate %s is half-finished; old and new "
+                   "states are both retained until commit or rollback"
+                   % sess.candidate_id,
+        ))
+
     # -- modes ----------------------------------------------------------
 
     def _feed_uniform(self, event: InputEvent, group: str) -> StepResult:
