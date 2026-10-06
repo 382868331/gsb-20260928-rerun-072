@@ -8,3 +8,8 @@ from .preview import SwitchPreview, UnexplainableStateError
 from .budget import Budget, BudgetReport, SwitchProjection, BudgetExceeded
 from .calibration import Calibration
 from .persistence import save_artifact, load_artifact
+from .joint import (
+    JointMigrationExecutor, JointPlan, JointReport, MigrationStep,
+    StepCheck, StepOutcome, StrategyComparison, check_joint_batch,
+    check_joint_order, compare_strategies, find_feasible_order,
+)

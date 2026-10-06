@@ -378,7 +378,9 @@ class Engine:
         for group, scheme in self.group_schemes.items():
             if scheme.name == target.name:
                 return group
-        raise ValueError("scheme %s is not a group candidate" % target.name)
+        # Research candidate outside the grouping rule (joint migration):
+        # the session keeps no group affiliation rather than crashing.
+        return None
 
     def budget_can_afford(self, scheme: PrecisionScheme) -> bool:
         if self.budget is None:
